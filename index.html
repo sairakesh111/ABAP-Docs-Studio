@@ -29,7 +29,7 @@ const drop=$('#drop');['dragenter','dragover'].forEach(x=>drop.addEventListener(
 const clean=s=>s.replace(/\s+/g,' ').trim();
 function extract(pattern,text,kind){const out=[];let m;const re=new RegExp(pattern,'gim');while((m=re.exec(text))!==null){out.push({name:m[1],line:text.slice(0,m.index).split('\n').length,kind,header:m[0].trim()})}return out}
 function analyze(){const raw=source.value.replace(/\r/g,'');if(!raw.trim()){clearResult('Add ABAP source first.');return}if(!looksLikeAbap(raw)){rejectNonAbap(false);return}const ls=raw.split('\n');
-const code=ls.map(l=>l.replace(/^\s*\*.*$/,'').replace(/".*$/,'')).join('\n');
+const extMarkerIndex=ls.findIndex(l=>/^\s*\*\s*EXPANDED IMPLEMENTATION NOTES\s*\/\s*VALIDATION HELPERS/i.test(l));const analysisLines=extMarkerIndex>=0?ls.slice(0,extMarkerIndex):ls;const code=analysisLines.map(l=>l.replace(/^\s*\*.*$/,'').replace(/".*$/,'')).join('\n');
 const routines=[...extract('^\\s*FORM\\s+([\\w-]+)',''+code,'FORM'),...extract('^\\s*METHOD\\s+([\\w~]+)',''+code,'METHOD'),...extract('^\\s*FUNCTION\\s+([\\w/]+)',''+code,'FUNCTION'),...extract('^\\s*MODULE\\s+([\\w-]+)',''+code,'MODULE')];
 const classDefs=extract('^\\s*CLASS\\s+([\\w/]+)\\s+DEFINITION\\b',''+code,'CLASS');
 const classes=[...new Map(classDefs.map(x=>[x.name.toUpperCase(),x])).values()];
@@ -51,7 +51,7 @@ const declared=[...new Set([...code.matchAll(/^\s*(?:DATA|CONSTANTS|TYPES|FIELD-
 const counts={lines:ls.length,forms:routines.filter(x=>x.kind==='FORM').length,methods:routines.filter(x=>x.kind==='METHOD').length,sql:databaseStatements.length};
 const firstComment=ls.map(l=>l.match(/^\s*\*\s?(.*)$/)?.[1]||l.match(/^\s*"\s?(.*)$/)?.[1]).find(x=>x&&clean(x));
 const report=/\bREPORT\s+([\w/]+)/i.exec(code),program=/\bPROGRAM\s+([\w/]+)/i.exec(code);const includeNames=[];const includeBlocks=/^\s*INCLUDE\s*:\s*([\s\S]*?)\./gim;for(const m of code.matchAll(includeBlocks)){for(const part of m[1].split(',')){const name=/^\s*([\w/]+)/.exec(part)?.[1];if(name&&!/^(?:TYPE|STRUCTURE|BOUND|DATA|TABLE)$/i.test(name))includeNames.push(name)}}const singleIncludes=/^\s*INCLUDE\s+([\w/]+)(?:\s+IF\s+FOUND)?\s*\./gim;for(const m of code.matchAll(singleIncludes)){if(!/^(?:TYPE|STRUCTURE|BOUND|DATA|TABLE)$/i.test(m[1]))includeNames.push(m[1])}const includes=[...new Map(includeNames.map(x=>[x.toUpperCase(),x])).values()];
-const title=report?.[1]||program?.[1]||filename.replace(/[-_]+/g,' ');
+const programTitle=ls.map(l=>l.match(/^\s*\*\s*PROGRAM TITLE\s*:\s*(.*?)\s*\*+\s*$/i)?.[1]?.trim()).find(Boolean);const title=programTitle||report?.[1]||program?.[1]||filename.replace(/[-_]+/g,' ');
 const ops=[];
 const transactionMatch=/\bCALL\s+TRANSACTION\s+(?:'([^']+)'|"([^"]+)"|([\w-]+))/i.exec(code);
 const constantValues=new Map([...code.matchAll(/\b([\w-]+)\s+TYPE\b[^.]*?\bVALUE\s+['"]([^'"]+)['"]/gi)].map(m=>[m[1].toUpperCase(),m[2]]));
@@ -61,10 +61,10 @@ const spreadsheetUpload=/\bGUI_UPLOAD\b|CL_FDT_XL_SPREADSHEET|ALSM_EXCEL_TO_INTE
 const headerDelete=internalDeletes.find(name=>/^(?:LT_)?FILE$/i.test(name))||internalDeletes[0]||'';
 if(spreadsheetUpload)ops.push('Uploads spreadsheet data and loads its rows into an internal table.');
 if(headerDelete)ops.push(`Removes row 1 from internal table ${headerDelete}; this is an in-memory table operation, not a database delete.`);
-if(bdcTransaction)ops.push(`Calls transaction ${transactionName} with BDC input. Processing is executed by the SAP transaction, not by direct database DML in this report.`);
+if(bdcTransaction)ops.push(`For each installment-plan row, executes transaction ${transactionName} with BDC input to request deactivation, collects the transaction messages, and displays the results in ALV. The report does not contain direct database DML for this change.`);
 else if(transactionMatch)ops.push(`Executes transaction ${transactionName} with CALL TRANSACTION.`);
-if(/\b(?:MESSAGES\s+INTO\s+\w+|BDCMSGCOLL)\b/i.test(code))ops.push('Collects transaction or BDC messages for result handling.');
-if(/CL_SALV_TABLE|REUSE_ALV/i.test(code)&&/->DISPLAY\s*\(|CALL\s+FUNCTION\s+'REUSE_ALV/i.test(code))ops.push('Displays the processing results in an ALV list.');
+if(!bdcTransaction&&/\b(?:MESSAGES\s+INTO\s+\w+|BDCMSGCOLL)\b/i.test(code))ops.push('Collects transaction or BDC messages for result handling.');
+if(!bdcTransaction&&/CL_SALV_TABLE|REUSE_ALV/i.test(code)&&/->DISPLAY\s*\(|CALL\s+FUNCTION\s+'REUSE_ALV/i.test(code))ops.push('Displays the processing results in an ALV list.');
 if(databaseStatements.some(x=>x.kind==='SELECT'))ops.push('Reads database records using Open SQL.');
 if(databaseStatements.some(x=>x.kind==='INSERT'))ops.push('Executes direct Open SQL INSERT statements.');
 if(databaseStatements.some(x=>x.kind==='UPDATE'))ops.push('Executes direct Open SQL UPDATE statements.');
@@ -78,6 +78,7 @@ const noEvidence='Not specified in the analyzed source.';
 const now=new Date();const generatedDate=[String(now.getDate()).padStart(2,'0'),String(now.getMonth()+1).padStart(2,'0'),now.getFullYear()].join('.');
 const odataEntities=[...new Set([...code.matchAll(/get_entity_type\s*\(\s*iv_entity_name\s*=\s*'([^']+)'/gi)].map(m=>m[1]))];
 const services=[...new Set([...code.matchAll(/\b(?:SERVICE\s+NAME|SERVICE\s+DOCUMENT|SERVICE)\s*:?\s*([A-Z0-9_]+_SRV)\b/gi)].map(m=>m[1]),...calls.filter(x=>/\/IWBEP\/|SERVICE|HTTP/i.test(x)))];
+const scopeNote=extMarkerIndex>=0?'The uploaded file contains a clearly marked “EXPANDED IMPLEMENTATION NOTES / VALIDATION HELPERS” section after the main implementation. That section is excluded from implemented code, class, and routine counts; the complete uploaded text remains in the source appendix.':'The full uploaded source was analyzed.';
 const outputNames=[...new Set([...code.matchAll(/(?:FIELDNAME\s*=|WRITE\s*:?\s*|RECEIVING\s+)([\w-]+)/gi)].map(m=>m[1]).filter(x=>!['TO','THE','FIELD-SYMBOL'].includes(x.toUpperCase())))];
 const programType=/\/IWBEP\/|_MPC(?:_EXT)?\b|_DPC(?:_EXT)?\b/i.test(code)?'O DATA Service':report?'Executable report':program?'ABAP program':classes.length?'Class-based ABAP':'ABAP source';
 const table=(headers,rows)=>['| '+headers.join(' | ')+' |','| '+headers.map(()=> '---').join(' | ')+' |',...rows.map(row=>'| '+row.join(' | ')+' |')];
@@ -106,14 +107,14 @@ parts.push(
   ...table(['Role','Approver','Date'],[['Author','',''],['Peer Reviewer','',''],['Business Process Expert','',''],['Business Process Architect','',''],['Solution Architect','','']]),
   '','','## Contents','','1 Process Description:','2 Process Flow Chart:','3 Dependencies / Constraints:','4 Assumptions:','5 Security Considerations:','6 Objects:','7 Performance Considerations:','8 Development Attributes:','   8.1 O Data Model','9 Program Functionality','   9.1 Output Fields','   9.2 Proposed Solutions:','   9.3 Pseudo Code / Flow Logic of the Solutions: -','      9.3.1 Selection Criteria covers:','      9.3.2 Processing data','      9.3.3 Displaying data','10 ABAP Code: -','11 Services','12 Technical Error Handling: -','13 Unit Testing: -',
   '','## 1 Process Description:','',`${action} ${flow}`,'',
-  `Source metrics: ${ls.length} lines; ${routines.length} detected routines; ${primaryClasses.length} primary class definitions; ${extensionClasses.length} additional class definition(s) with an _EXT suffix; ${databaseStatements.length} direct Open SQL statement(s); ${tables.length} database table(s) identified in Open SQL.`,
+  `Source metrics: ${ls.length} uploaded lines; ${analysisLines.length} lines analyzed as implementation; ${routines.length} detected routines; ${classes.length} class definition(s); ${databaseStatements.length} direct Open SQL statement(s); ${tables.length} database table(s) identified in Open SQL. ${scopeNote}`,
   '','## 2 Process Flow Chart:','',events.length?`Detected ABAP event blocks: ${events.join(', ')}.`:routines.length?`Detected routines are listed in section 9.3. The caller and runtime entry point are ${noEvidence.toLowerCase()}`:'No explicit report event or named routine was detected. Runtime entry point is not specified in the source.',
   '','## 3 Dependencies / Constraints:','',includes.length?'Include dependencies detected:':'No INCLUDE statements were detected.',...includes.map(x=>`- ${x}`),calls.length?'CALL statements detected (targets may include transactions, methods, or functions):':'No explicit CALL statements were detected.',...calls.map(x=>`- ${x}`),
   '','## 4 Assumptions:','','Business rules, SAP customizing, and the surrounding runtime context cannot be established from this source alone. Verify these items with the functional owner.',
   '','## 5 Security Considerations:','',/\bAUTHORITY-CHECK\b/i.test(code)?'AUTHORITY-CHECK statements are present. Confirm the authorization object, checked fields, and return-code handling.':'No AUTHORITY-CHECK statement was detected. SAP authorization may also be enforced by the caller or service configuration.',
   '','## 6 Objects:','',...table(['Object','Detected value'],[['ABAP program',report?.[1]||program?.[1]||noEvidence],['Class definitions',classes.map(x=>x.name).join(', ')||noEvidence],['Includes',includes.join(', ')||noEvidence],['Open SQL database tables',tables.join(', ')||'No Open SQL table references detected'],['Routines',routines.map(routineLabel).join(', ')||noEvidence],['Internal table row deletions',internalDeletes.join(', ')||'None detected']]),
   '','## 7 Performance Considerations:','',databaseStatements.length?`${databaseStatements.length} direct Open SQL statement(s) were detected. Review database filters, repeated access inside loops, result volume, and aggregation.`:'No direct Open SQL SELECT/INSERT/UPDATE/DELETE FROM statements were detected. Database changes may still be performed indirectly by called transactions or APIs. Review processing loops and those calls for runtime cost.',
-  '','## 8 Development Attributes:','',...table(['Attribute','Value'],[['Project Name',report?.[1]||program?.[1]||title],['Title',title],['Application',noEvidence],['Program Type',programType],['Primary class definition(s)',primaryClasses.map(x=>x.name).join(', ')||'None detected'],['Additional _EXT class definition(s)',extensionClasses.map(x=>x.name).join(', ')||'None detected'],['Structures / declarations',declarations.join(', ')||noEvidence],['Source line count',String(ls.length)]]),
+  '','## 8 Development Attributes:','',...table(['Attribute','Value'],[['Project Name',report?.[1]||program?.[1]||title],['Title',title],['Application',noEvidence],['Program Type',programType],['Class definition(s) in analyzed implementation',classes.map(x=>x.name).join(', ')||'None detected'],['Example declaration names detected',declarations.join(', ')||noEvidence],['Uploaded source line count',String(ls.length)],['Implementation lines analyzed',String(analysisLines.length)]]),
   '','### 8.1 O Data Model','',...table(['Entity Type','Entity Set / Service Model Evidence'],modelRows),
   '','## 9 Program Functionality','',`${action} ${flow}`,'','### 9.1 Output Fields','',outputNames.length?outputNames.map(x=>`- ${x}`).join('\n'):`${noEvidence} Output field names are reported only when explicitly detectable in the source.`,
   '','### 9.2 Proposed Solutions:','',`Detected behavior: ${ops.join(' ')||noEvidence} This section describes source evidence; it does not imply that suggested behavior is already implemented.`,
